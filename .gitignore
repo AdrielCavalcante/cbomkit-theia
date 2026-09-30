@@ -41,3 +41,6 @@ cbomkit-theia_graphs/
 /*.json
 cbomkit-theia
 *.prof
+
+# Local Git worktrees
+.worktree/
