@@ -6,7 +6,7 @@
 
 ## Build, Test, and Development Commands
 
-Use the Go version declared in `go.mod` (currently 1.26.3). Run `go mod download` to fetch dependencies and `go build ./...` to compile all packages. `go run . dir ./testdata/empty/dir` exercises the directory CLI; `go run . image <image>` scans a container image and may require Docker access. Run `go test ./...` for the full suite and `go vet ./...` for static checks. CI also builds and tests every package. Run `go mod tidy` when dependencies change, and review the resulting `go.mod` and `go.sum` diff.
+Use the Go version declared in `go.mod`. Run `go mod download` to fetch dependencies and `go build ./...` to compile all packages. `go run . dir ./testdata/empty/dir` exercises the directory CLI; `go run . image <image>` scans a container image and may require Docker access. Run `go test ./...` for the full suite and `go vet ./...` for static checks. CI also builds and tests every package. Run `go mod tidy` when dependencies change, and review the resulting `go.mod` and `go.sum` diff.
 
 ## Coding Style & Naming Conventions
 
