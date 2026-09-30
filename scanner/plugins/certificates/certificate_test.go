@@ -23,6 +23,7 @@ import (
 	x509lib "github.com/cbomkit/cbomkit-theia/scanner/x509"
 	"github.com/stretchr/testify/assert"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -148,4 +149,77 @@ func TestIssue56(t *testing.T) {
 			t.Fail()
 		}
 	})
+}
+
+func TestIssue227_MLDSACertificates(t *testing.T) {
+	// The example certificates from RFC 9881, see: https://datatracker.ietf.org/doc/html/rfc9881
+	tests := []struct {
+		file         string
+		name         string
+		parameterSet string
+		oid          string
+		keySize      int
+	}{
+		{"mldsa44.pem", "ML-DSA-44", "44", "2.16.840.1.101.3.4.3.17", 1312 * 8},
+		{"mldsa65.pem", "ML-DSA-65", "65", "2.16.840.1.101.3.4.3.18", 1952 * 8},
+		{"mldsa87.pem", "ML-DSA-87", "87", "2.16.840.1.101.3.4.3.19", 2592 * 8},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join("../../../testdata/mldsa_certificate/dir", test.file)
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			certs, err := parseX509CertFromPath(raw, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !assert.Len(t, certs, 1) {
+				return
+			}
+
+			// The certificate should not be dropped because crypto/x509 does not know the algorithm
+			components, dependencyMap, err := x509lib.GenerateCdxComponents(certs[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			bom := cdx.NewBOM()
+			cyclonedx.AddComponents(bom, *components)
+			cyclonedx.AddDependencies(bom, *dependencyMap)
+
+			foundCertificate := false
+			for _, component := range *bom.Components {
+				if component.CryptoProperties.AssetType != cdx.CryptoAssetTypeCertificate {
+					continue
+				}
+				foundCertificate = true
+				assert.Equal(t, "LAMPS WG", component.Name)
+
+				signatureAlgorithm := cyclonedx.GetByBomRef(component.CryptoProperties.CertificateProperties.SignatureAlgorithmRef, bom.Components)
+				if assert.NotNil(t, signatureAlgorithm) {
+					assert.Equal(t, test.name, signatureAlgorithm.Name)
+					assert.Equal(t, test.oid, signatureAlgorithm.CryptoProperties.OID)
+					assert.Equal(t, test.parameterSet, signatureAlgorithm.CryptoProperties.AlgorithmProperties.ParameterSetIdentifier)
+					assert.Equal(t, cdx.CryptoPrimitiveSignature, signatureAlgorithm.CryptoProperties.AlgorithmProperties.Primitive)
+				}
+
+				publicKey := cyclonedx.GetByBomRef(component.CryptoProperties.CertificateProperties.SubjectPublicKeyRef, bom.Components)
+				if assert.NotNil(t, publicKey) {
+					assert.Equal(t, test.name, publicKey.Name)
+					assert.Equal(t, test.oid, publicKey.CryptoProperties.OID)
+					assert.Equal(t, cdx.RelatedCryptoMaterialTypePublicKey, publicKey.CryptoProperties.RelatedCryptoMaterialProperties.Type)
+					assert.Equal(t, test.keySize, *publicKey.CryptoProperties.RelatedCryptoMaterialProperties.Size)
+
+					publicKeyAlgorithm := cyclonedx.GetByBomRef(publicKey.CryptoProperties.RelatedCryptoMaterialProperties.AlgorithmRef, bom.Components)
+					if assert.NotNil(t, publicKeyAlgorithm) {
+						assert.Equal(t, test.name, publicKeyAlgorithm.Name)
+						assert.Equal(t, test.oid, publicKeyAlgorithm.CryptoProperties.OID)
+					}
+				}
+			}
+			assert.True(t, foundCertificate)
+		})
+	}
 }
