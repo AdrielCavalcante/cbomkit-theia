@@ -342,16 +342,14 @@ func (x509CertificateWithMetadata *CertificateWithMetadata) getSignatureAlgorith
 		}, nil
 	default:
 		// crypto/x509 does not know every algorithm (e.g., ML-DSA before Go 1.27), so check the OID in the certificate
-		if oid, err := x509CertificateWithMetadata.getSignatureAlgorithmOID(); err == nil {
-			if parameterSet, ok := mldsaParameterSets[oid]; ok {
-				// Since there is no hash, ML-DSA *is* the composite hashAndSignature algorithm
-				hashAndSignature = getMLDSAAlgorithmComponent(path, parameterSet, oid)
-				return signatureAlgorithmResult{
-					hashAndSignature: &hashAndSignature,
-					hash:             nil, // No hash, see: https://datatracker.ietf.org/doc/html/rfc9881
-					signature:        nil,
-				}, nil
-			}
+		if oid, parameterSet, ok := x509CertificateWithMetadata.getMLDSASignatureParameterSet(); ok {
+			// Since there is no hash, ML-DSA *is* the composite hashAndSignature algorithm
+			hashAndSignature = getMLDSAAlgorithmComponent(path, parameterSet.identifier, oid)
+			return signatureAlgorithmResult{
+				hashAndSignature: &hashAndSignature,
+				hash:             nil, // No hash, see: https://www.rfc-editor.org/rfc/rfc9881.html
+				signature:        nil,
+			}, nil
 		}
 		return signatureAlgorithmResult{
 			hashAndSignature: nil,
@@ -404,22 +402,25 @@ func (x509CertificateWithMetadata *CertificateWithMetadata) getPublicKeyAlgorith
 		return getEd25519AlgorithmComponent(x509CertificateWithMetadata.path), nil
 	default:
 		// crypto/x509 does not know every algorithm (e.g., ML-DSA before Go 1.27), so check the OID in the certificate
-		if publicKeyInfo, err := x509CertificateWithMetadata.getSubjectPublicKeyInfo(); err == nil {
-			oid := publicKeyInfo.Algorithm.Algorithm.String()
-			if parameterSet, ok := mldsaParameterSets[oid]; ok {
-				return getMLDSAAlgorithmComponent(x509CertificateWithMetadata.path, parameterSet, oid), nil
-			}
+		if oid, parameterSet, ok := x509CertificateWithMetadata.getMLDSAPublicKeyParameterSet(); ok {
+			return getMLDSAAlgorithmComponent(x509CertificateWithMetadata.path, parameterSet.identifier, oid), nil
 		}
 		return cdx.Component{}, errors.ErrX509UnknownAlgorithm
 	}
 }
 
+// An ML-DSA parameter set with the size of its public key in bytes
+type mldsaParameterSet struct {
+	identifier    string
+	publicKeySize int
+}
+
 // OIDs of the ML-DSA parameter sets. In X.509 the same OID identifies the public key and the signature algorithm,
-// see: https://datatracker.ietf.org/doc/html/rfc9881
-var mldsaParameterSets = map[string]string{
-	"2.16.840.1.101.3.4.3.17": "44",
-	"2.16.840.1.101.3.4.3.18": "65",
-	"2.16.840.1.101.3.4.3.19": "87",
+// see: https://www.rfc-editor.org/rfc/rfc9881.html
+var mldsaParameterSets = map[string]mldsaParameterSet{
+	"2.16.840.1.101.3.4.3.17": {identifier: "44", publicKeySize: 1312},
+	"2.16.840.1.101.3.4.3.18": {identifier: "65", publicKeySize: 1952},
+	"2.16.840.1.101.3.4.3.19": {identifier: "87", publicKeySize: 2592},
 }
 
 // The outer structure of an X.509 certificate, see: https://datatracker.ietf.org/doc/html/rfc5280#section-4.1
@@ -435,44 +436,57 @@ type subjectPublicKeyInfo struct {
 	PublicKey asn1.BitString
 }
 
-// Get the OID of the algorithm used by the issuer to sign this certificate
-func (x509CertificateWithMetadata *CertificateWithMetadata) getSignatureAlgorithmOID() (string, error) {
-	var cert certificate
-	if _, err := asn1.Unmarshal(x509CertificateWithMetadata.Raw, &cert); err != nil {
-		return "", err
+// Get the OID and the ML-DSA parameter set of an algorithm identifier.
+// The parameters have to be absent, see: https://www.rfc-editor.org/rfc/rfc9881.html#section-2
+func getMLDSAParameterSet(algorithm pkix.AlgorithmIdentifier) (string, mldsaParameterSet, bool) {
+	if len(algorithm.Parameters.FullBytes) != 0 {
+		return "", mldsaParameterSet{}, false
 	}
-	return cert.SignatureAlgorithm.Algorithm.String(), nil
+	oid := algorithm.Algorithm.String()
+	parameterSet, ok := mldsaParameterSets[oid]
+	return oid, parameterSet, ok
 }
 
-// Get the public key of this certificate as it is encoded in the certificate
-func (x509CertificateWithMetadata *CertificateWithMetadata) getSubjectPublicKeyInfo() (subjectPublicKeyInfo, error) {
+// Get the OID and the ML-DSA parameter set of the algorithm used by the issuer to sign this certificate
+func (x509CertificateWithMetadata *CertificateWithMetadata) getMLDSASignatureParameterSet() (string, mldsaParameterSet, bool) {
+	var cert certificate
+	if _, err := asn1.Unmarshal(x509CertificateWithMetadata.Raw, &cert); err != nil {
+		return "", mldsaParameterSet{}, false
+	}
+	return getMLDSAParameterSet(cert.SignatureAlgorithm)
+}
+
+// Get the OID and the ML-DSA parameter set of the public key in this certificate.
+// The public key has to have the size of its parameter set, see: https://www.rfc-editor.org/rfc/rfc9881.html#section-4
+func (x509CertificateWithMetadata *CertificateWithMetadata) getMLDSAPublicKeyParameterSet() (string, mldsaParameterSet, bool) {
 	var publicKeyInfo subjectPublicKeyInfo
-	_, err := asn1.Unmarshal(x509CertificateWithMetadata.RawSubjectPublicKeyInfo, &publicKeyInfo)
-	return publicKeyInfo, err
+	if _, err := asn1.Unmarshal(x509CertificateWithMetadata.RawSubjectPublicKeyInfo, &publicKeyInfo); err != nil {
+		return "", mldsaParameterSet{}, false
+	}
+	oid, parameterSet, ok := getMLDSAParameterSet(publicKeyInfo.Algorithm)
+	if !ok || publicKeyInfo.PublicKey.BitLength != parameterSet.publicKeySize*8 {
+		return "", mldsaParameterSet{}, false
+	}
+	return oid, parameterSet, true
 }
 
 // Generate the CycloneDX component for an ML-DSA public key based on the OID in the certificate
 func (x509CertificateWithMetadata *CertificateWithMetadata) getMLDSAPublicKeyComponent() (*cdx.Component, error) {
-	publicKeyInfo, err := x509CertificateWithMetadata.getSubjectPublicKeyInfo()
-	if err != nil {
-		return nil, errors.ErrUnknownKeyAlgorithm
-	}
-	oid := publicKeyInfo.Algorithm.Algorithm.String()
-	parameterSet, ok := mldsaParameterSets[oid]
+	oid, parameterSet, ok := x509CertificateWithMetadata.getMLDSAPublicKeyParameterSet()
 	if !ok {
 		return nil, errors.ErrUnknownKeyAlgorithm
 	}
-	size := len(publicKeyInfo.PublicKey.Bytes) * 8
+	size := parameterSet.publicKeySize * 8
 	return &cdx.Component{
 		Type:   cdx.ComponentTypeCryptographicAsset,
-		Name:   fmt.Sprintf("ML-DSA-%v", parameterSet),
+		Name:   fmt.Sprintf("ML-DSA-%v", parameterSet.identifier),
 		BOMRef: uuid.New().String(),
 		CryptoProperties: &cdx.CryptoProperties{
 			AssetType: cdx.CryptoAssetTypeRelatedCryptoMaterial,
 			RelatedCryptoMaterialProperties: &cdx.RelatedCryptoMaterialProperties{
 				Type:   cdx.RelatedCryptoMaterialTypePublicKey,
 				Size:   &size,
-				Format: "PEM",
+				Format: "DER", // The value is the DER encoded SubjectPublicKeyInfo
 				Value:  base64.StdEncoding.EncodeToString(x509CertificateWithMetadata.RawSubjectPublicKeyInfo),
 			},
 			OID: oid,
@@ -565,6 +579,7 @@ func getMLDSAAlgorithmComponent(path string, parameterSet string, oid string) cd
 	comp := getGenericSignatureAlgorithmComponent(path)
 	comp.Name = fmt.Sprintf("ML-DSA-%v", parameterSet)
 	comp.CryptoProperties.AlgorithmProperties.ParameterSetIdentifier = parameterSet
+	comp.CryptoProperties.AlgorithmProperties.CryptoFunctions = &[]cdx.CryptoFunction{cdx.CryptoFunctionKeygen, cdx.CryptoFunctionSign, cdx.CryptoFunctionVerify}
 	comp.CryptoProperties.OID = oid
 	return comp
 }
